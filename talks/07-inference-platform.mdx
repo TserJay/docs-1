@@ -7,12 +7,13 @@ tag: "即将到来"
   **预计时间**：2026-03-01
 </Info>
 
-推理平台（Inference Platform）是位于推理引擎（如 vLLM、SGLang）之上、面向生产环境的基础设施层。推理引擎专注于模型加载和推理计算本身，而推理平台则在此之上提供生产级的编排和管理能力：
+推理平台（Inference Platform）是位于推理引擎（如 vLLM、SGLang）之上、面向生产环境的基础设施层。推理引擎专注于模型加载和推理计算本身，而推理平台则在此之上提供生产级的编排和管理能力，例如：
 
-- **多推理引擎支持**：通过统一的 Kubernetes API 管理 vLLM、SGLang、Triton、TorchServe 等不同推理引擎。
-- **智能路由与负载均衡**：提供面向 LLM 推理优化的路由策略，如 Prefix Cache 匹配、KV Cache 利用率、请求队列深度、LoRA 亲和性路由等。
-- **流量管理与发布策略**：支持金丝雀发布、加权流量分配、基于 token 的速率限制和自动故障转移，以及零停机的滚动更新。
-- **PD 分离**：支持通过分离 prefill 和 decode 节点来优化大模型服务以提升性能。
+- **多推理引擎支持**：支持 vLLM、SGLang、TensorRT-LLM 等不同推理引擎。
+- **智能路由与负载均衡**：提供面向 LLM 推理优化的路由策略，如 Prefix Cache 感知、KV Cache 利用率、请求队列深度、LoRA 亲和性路由等。
+- **流量管理与发布策略**：支持金丝雀发布、加权流量分配，以及零停机的滚动更新。
+- **容错机制**：支持请求迁移、请求取消、优雅关闭、过载拒绝等自动故障转移能力，保障生产环境的高可用性。
+- **PD 分离**：支持通过分离 Prefill 和 Decode 节点来优化大模型服务以提升性能。
 - **分布式推理编排**：支持多节点、多 GPU 的分布式推理编排，例如通过 Ray 等管理分布式工作负载的创建和生命周期，使得超大模型（如 DeepSeek V3 685B）可以跨多节点部署和服务。
 - **弹性伸缩**：基于 GPU 利用率、KV Cache 占用率、请求队列深度等指标自动扩缩容。
 - **模型与 KV Cache 管理**：支持本地缓存预热模型加速推理服务启动，提供中心化的分布式 KV Cache Pool 实现跨推理实例的 KV Cache 共享和复用。
@@ -26,7 +27,7 @@ tag: "即将到来"
 
 ## 1. NVIDIA Dynamo
 
-[Dynamo](https://github.com/ai-dynamo/dynamo) 是 NVIDIA 开源的高吞吐、低延迟推理框架，专为在多节点分布式环境中服务生成式 AI 和推理模型而设计。Dynamo 支持多种推理引擎（例如 TRT-LLM、vLLM、SGLang），使用 Rust 构建核心以保证性能，Python 提供可扩展性，主要特性包括：
+[Dynamo](https://github.com/ai-dynamo/dynamo) 是 NVIDIA 开源的高吞吐、低延迟推理框架，专为在多节点分布式环境中服务生成式 AI 和推理模型而设计。Dynamo 支持多种推理引擎（例如 TensorRT-LLM、vLLM、SGLang），使用 Rust 构建核心以保证性能，Python 提供可扩展性，主要特性包括：
 
 - **Prefill-Decode 分离**：在延迟和吞吐之间灵活权衡，最大化 GPU 吞吐。
 - **动态 GPU 调度**：根据波动的需求动态优化性能。
@@ -88,6 +89,10 @@ Dynamo 的 PD 分离由 `PrefillRouter` 协调，整体流程如下：
 5. **Token 生成**：Decode Worker 执行 Decode 阶段，生成并返回 token。
 
 <img src="https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260224224218702.png" width="600" />
+
+<Tip>
+PrefillRouter 运行在 Frontend 进程内部，不是独立部署的组件。
+</Tip>
 
 以下是 PD 分离的 DynamoGraphDeployment 配置示例。与聚合模式相比，PD 分离的关键配置差异在于：
 
@@ -235,6 +240,12 @@ SLA Planner 使用复杂的扩缩容算法。在每个调整间隔，SLA Planner
 - 输入/输出序列长度
 
 **2. 校正因子计算**
+
+
+
+<Tip>
+校正因子是用生产环境的实际表现去修正理想条件下的 profiling 预测。具体做法是计算 `实际值 / 预期值` 得到校正系数，然后在计算所需副本数时将其带入公式，调整每 GPU 的吞吐量估算，使扩缩容决策更贴近真实情况。
+</Tip>
 
 使用收集的指标，SLA Planner 应用 Interpolator 找出预期的 TTFT/ITL 并校准插值模型。这一步很重要，因为实际的 TTFT/ITL 通常与理想情况不同：
 - **TTFT**：实际 TTFT 严重依赖于请求排队和 Prefix Cache 命中率（如果使用 KV 复用）。例如，如果所有请求都在调整间隔开始时到达，由于当前 Worker 数量是基于上一周期的负载预测的，Planner 还没来得及扩容，请求只能排队等待，TTFT 会显著更高。如果 Prefix Cache 命中率很高，Prefill 中的实际 token 数量会很低，TTFT 会显著更低。
