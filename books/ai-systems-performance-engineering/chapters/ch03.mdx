@@ -4,16 +4,631 @@ title: "第三章：GPU 环境下的 OS、Docker 与 Kubernetes 调优"
 
 ## 本章概要
 
-{/* 在此添加本章的内容概要 */}
+本章围绕一个核心问题：**即使 GPU 代码和库已经高度优化，系统层面的瓶颈仍然会限制大规模 AI 训练的性能**。最快的 GPU 也只有在数据和指令能高效到达的前提下才能发挥全部潜力。系统级调优常被忽视，但在大集群上，仅 OS 配置的小改动就可能带来两位数百分比的性能提升，换算到大型 AI 项目就是数十万甚至上百万美元的计算成本节约。
+
+全章从底向上覆盖了四个层次的优化：**操作系统 → GPU 驱动与运行时 → 容器运行时 → Kubernetes 编排**。每层的目标一致——最小化延迟、最大化吞吐量，让 GPU 始终处于满负荷工作状态。
+
+<Info>
+**配套代码仓库**中的 `ch03/` 目录提供了可运行的 benchmark 对（baseline vs optimized），你可以用 `python -m ch03.compare` 一键验证本章描述的所有优化效果。
+</Info>
+
+---
 
 ## 关键概念
 
-{/* 在此记录本章的关键概念 */}
+### 1. NVIDIA 软件栈全景
+
+GPU 集群的运行远不止编写 PyTorch 代码。完整的软件栈从底到顶：
+
+| 层级 | 组件 | 作用 |
+| --- | --- | --- |
+| 硬件接口 | **GPU Driver** | 内存分配、任务调度、多租户分区；安装后创建 `/dev/nvidia0`、`/dev/nvidiactl`、`/dev/nvidia-uvm` 等设备文件 |
+| 编译与运行时 | **CUDA Toolkit** | 编译器 `nvcc`、运行时 `cudart`；优化库 cuDNN（神经网络）、cuBLAS（线性代数）、NCCL（多 GPU 通信） |
+| Python CUDA 库 | **cuTile / cuPyNumeric / Triton** | 降低 Python 开发者使用 GPU 的门槛；Triton 已集成进 PyTorch 编译器后端 |
+| 高层框架 | **PyTorch** | TorchDynamo → AOT Autograd → TorchInductor/Triton 自动捕获和优化模型 |
+
+当你执行 `torch.matmul(A, B)` 时，PyTorch 把它委托给 cuBLAS → cuBLAS 调用 CUDA Runtime → CUDA Runtime 与 GPU Driver 通信 → Driver 在 GPU 上调度内核。每一层都可能引入瓶颈。
+
+#### CUDA 前向兼容性与 fatbinary
+
+CUDA 编译输出同时包含：
+- **PTX**（中间表示）— 可被新 GPU JIT 编译，提供前向兼容
+- **CUBIN / SASS**（特定架构的机器码）— 已知架构直接执行
+
+两者打包为 **fatbinary**，同时支持当前和未来硬件。发布时应始终包含 PTX 以保证前向兼容。
+
+### 2. CPU 与操作系统调优
+
+GPU 利用率不高的最常见原因：**CPU 没能及时喂数据给 GPU**。CPU 负责数据加载、tokenize、变换、分发内核、线程协调——任何一步慢了，GPU 就空闲。
+
+#### 2.1 NUMA 感知与 CPU 绑定
+
+**NUMA node** 是物理上就近的 CPU、GPU、NIC 和内存的分组。跨 NUMA 访问延迟可增加约 75%。
+
+书中的实测数据：
+
+| 访问类型 | 延迟 |
+| --- | --- |
+| 本地 NUMA 节点内存 | ~80 ns |
+| 跨 NUMA 节点内存 | ~139 ns |
+
+在一个 8 GPU 的节点上（4 个 GPU 连接 NUMA node 0，4 个连接 NUMA node 1），如果 GPU 4 的训练进程跑在 NUMA node 0 的 CPU 上，每次内存访问都要跨节点——这就是为什么需要 **CPU pinning**。
+
+**命令行方式：**
+
+```bash
+# 将进程绑定到 GPU 4 所在的 NUMA node 1
+numactl --cpunodebind=1 --membind=1 python train.py --gpu 4
+```
+
+**动态查询拓扑并绑定（书中脚本）：**
+
+```bash
+#!/bin/bash
+for GPU in 0 1 2 3; do
+  NODE=$(nvidia-smi topo -m -i $GPU \
+    | awk '/NUMA Affinity/ {print $NF}')
+  numactl --cpunodebind=$NODE --membind=$NODE \
+    bash -c "CUDA_VISIBLE_DEVICES=$GPU python train.py --gpu $GPU"
+done
+```
+
+<Tip>
+配套代码 `ch03/numa_topology_script.sh` 实现了这个脚本，`ch03/bind_numa_affinity.py` 则提供了 Python 版本的 NUMA 绑定工具，支持 NVML → sysfs → numactl 多级回退。
+</Tip>
+
+**PyTorch DataLoader 中的 NUMA 绑定：**
+
+书中给出了一个完整的示例（约 100 行），核心思路是：
+
+1. 启动时用 NVML 查询当前 GPU 的 NUMA node（`nvmlDeviceGetNUMANodeId` 或 `nvmlDeviceGetCpuAffinity`）
+2. 用 `psutil.Process().cpu_affinity()` + `libnuma` 绑定主进程
+3. 在 `DataLoader` 的 `worker_init_fn` 中**显式重新绑定每个 worker**——不能依赖继承
+
+```python
+init_fn = partial(_worker_init_fn, node=gpu_node, cpus=cpus)
+dataloader = DataLoader(
+    dataset,
+    batch_size=32,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,  # 避免 worker 重新 fork 丢失亲和性
+    worker_init_fn=init_fn,
+    prefetch_factor=2,
+)
+```
+
+<Warning>
+`numactl` 的策略在 `fork` 子进程中可继承，但 `spawn` 或 `exec` 模式下**不会继承**。Python 框架管理的 worker 进程必须显式重新设置 CPU 和内存策略。
+</Warning>
+
+**性能影响：** 仅消除跨 NUMA 流量和 CPU 核心迁移，训练吞吐量就可提升 **5%–10%**，同时减少性能抖动。
+
+<Accordion title="验证方式：运行配套代码的 NUMA benchmark">
+
+`ch03/baseline_numa_unaware.py` 使用约 512 MB 的 pageable 内存和阻塞拷贝；`ch03/optimized_numa_unaware.py` 使用 pinned memory + 双缓冲 + 异步拷贝流。运行对比：
+
+```bash
+cd ai-performance-engineering/code
+python -m ch03.compare --examples numa_unaware
+```
+
+你也可以用 `nvidia-smi topo -m` 查看你的系统拓扑，再用 `numactl --show` 确认当前进程的绑定状态。
+
+</Accordion>
+
+#### 2.2 内存绑定与 Pinned Memory
+
+`--membind` 强制在指定 NUMA 节点分配内存，保证 memory → CPU → GPU 链路在同一 NUMA 节点内。
+
+**Pinned（page-locked）memory** 是高效 GPU 访问的基础：
+
+- OS 不会 swap 或移动它
+- GPU/NIC 可直接 DMA
+- 拷贝速度比 pageable memory 快 **2–3×**
+- PyTorch `DataLoader(pin_memory=True)` 配合 `tensor.to(device, non_blocking=True)` 可提升 **10%–20%** 性能
+
+```bash
+# 用 CUDA 自带工具测量 pinned vs pageable 传输带宽
+bandwidthTest --memory=pinned
+bandwidthTest --memory=pageable
+```
+
+这也是 GPUDirect RDMA（NIC 直通 GPU 内存）和 GPUDirect Storage（NVMe 直通 GPU 内存）的基础。
+
+<Warning>
+OS 对用户可锁定内存有限制（`ulimit -l`），容器环境中需通过 `--ulimit memlock=-1` 调整。AI 训练通常设为 `unlimited`。
+</Warning>
+
+<Accordion title="验证方式：Docker baseline vs optimized benchmark">
+
+`ch03/baseline_docker.py` 使用**非 pinned 内存 + 阻塞拷贝**；`ch03/optimized_docker.py` 使用 **pinned 内存 + 双缓冲预取 + copy stream 异步重叠**：
+
+```bash
+python -m ch03.compare --examples docker
+```
+
+optimized 版本的核心优化——`Prefetcher` 类：
+
+```python
+class Prefetcher:
+    def __init__(self, device, host_batches, targets):
+        self.copy_stream = torch.cuda.Stream()
+        self.buffers = [torch.empty_like(..., device=device), ...]  # 双缓冲
+        self._prefetch()
+
+    def _prefetch(self):
+        with torch.cuda.stream(self.copy_stream):
+            self.buffers[self.next_slot].copy_(host_batch, non_blocking=True)
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        self.cur_slot, self.next_slot = self.next_slot, self.cur_slot
+        self._prefetch()
+        return self.buffers[self.cur_slot], ...
+```
+
+README 中报告的实测结果：baseline `4.456 ms` → optimized `1.225 ms`，**3.64× 加速**。
+
+</Accordion>
+
+#### 2.3 Transparent Hugepages (THP)
+
+Linux 默认使用 4 KB 页，但管理数百万小页对大内存进程效率低。Hugepages（2 MB / 1 GB）可减少 TLB miss 和 page fault。
+
+| 场景 | 建议 | 原因 |
+| --- | --- | --- |
+| 训练（关注吞吐） | `echo always > /sys/kernel/mm/transparent_hugepage/enabled` | ~3%–5% 吞吐提升 |
+| 推理（关注延迟） | `echo never > /sys/kernel/mm/transparent_hugepage/enabled` | 避免后台 compaction 引起的不可预测停顿 |
+| 折中方案 | `echo madvise > ...` | 按需使用 |
+
+对于非常大的 pinned buffer（如 I/O 预分配），可考虑用 `vm.nr_hugepages` 或 `hugetlbfs` 手动分配显式 hugepages 以获得更确定性的性能。
+
+<Accordion title="验证方式：system_tuning.sh">
+
+`ch03/system_tuning.sh` 包含了 THP 配置。查看当前状态和切换：
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# 输出示例: [always] madvise never
+
+# 切换为训练模式
+echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+# 切换为推理模式
+echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+</Accordion>
+
+#### 2.4 调度器与中断亲和性
+
+- 使用 `isolcpus`、`nohz_full` 内核参数或 cgroup `cpuset` 隔离计算核心，防止 OS 调度器抢占
+- 将 GPU/NIC 硬件中断绑定到同一 NUMA 节点的 CPU 核心，避免跨节点中断处理
+- 禁用或定制 `irqbalance`；手动设置 `/proc/irq/*/smp_affinity`
+
+```bash
+# 绑定 GPU 中断到特定 CPU（来自 system_tuning.sh）
+for irq in $(grep nvidia /proc/interrupts | cut -d: -f1); do
+    echo 2 > /proc/irq/$irq/smp_affinity
+done
+```
+
+<Tip>
+`ch03/cpu_gpu_numa_optimizations.sh` 是为 GB200/GB300（Grace CPU + Blackwell GPU）定制的完整调优脚本，覆盖 CPU governor、NUMA balancing、THP、persistence mode、IRQ 亲和性。
+</Tip>
+
+#### 2.5 虚拟内存与 Swap
+
+GPU 程序分配大量 host memory。如果 OS 把数据 swap 到磁盘，GPU 会经历**多个数量级的延迟增加**。
+
+```bash
+# 设置 swappiness 为 0（仅极端内存压力时才 swap）
+echo 0 | sudo tee /proc/sys/vm/swappiness
+
+# 完全禁用 swap（确保有足够 RAM）
+sudo swapoff -a
+
+# 监控 swap 使用
+free -m | grep Swap
+```
+
+#### 2.6 文件系统缓存与 Checkpoint 写入
+
+大训练任务需要频繁写 checkpoint。multi-GB 的 checkpoint 可能填满 page cache 并导致 stall。
+
+```bash
+# 调整 dirty ratio，让 OS 在 RAM 中缓冲更多数据再刷盘
+echo 20 | sudo tee /proc/sys/vm/dirty_ratio
+echo 10 | sudo tee /proc/sys/vm/dirty_background_ratio
+```
+
+对延迟敏感的场景，可以：
+- 用 `O_DIRECT` 绕过 page cache
+- 用 `io_uring` 异步 I/O
+- 写完 checkpoint 后用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` 立即释放 cache
+- PyTorch 支持分布式 checkpoint 分区写入
+
+#### 2.7 CPU 频率与 C-states
+
+默认省电模式下，空闲 CPU 会降频或进入深度睡眠。唤醒延迟虽然只有几微秒，但积累起来会导致 **GPU bubble**（GPU 等 CPU 恢复数据处理的空闲期）。
+
+```bash
+# 设置 CPU 为高性能模式
+cpupower frequency-set -g performance
+
+# 内核启动参数限制 C-states（需修改 GRUB）
+# GRUB_CMDLINE_LINUX="... processor.max_cstate=1 intel_idle.max_cstate=0"
+```
+
+#### 2.8 Host 内存分配器调优
+
+`jemalloc` 和 `tcmalloc` 比 glibc 默认 `malloc` 更适合 GPU 服务器的多线程数据准备场景。
+
+```bash
+# jemalloc 调优
+export MALLOC_CONF="narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true"
+
+# tcmalloc 调优
+export TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=$((512*1024*1024))
+export TCMALLOC_RELEASE_RATE=16
+```
+
+<Accordion title="验证方式：gpu_setup_commands.sh 一站式参考">
+
+`ch03/gpu_setup_commands.sh` 汇集了上述所有 OS 级命令：persistence mode、CPU governor、swapoff、jemalloc/tcmalloc 配置、ulimit、GPUDirect RDMA/GDS、NUMA 绑定和 Docker 示例。可作为 GPU 服务器初始化的 checklist。
+
+</Accordion>
+
+### 3. GPU 驱动与运行时设置
+
+#### 3.1 GPU Persistence Mode
+
+默认 GPU 空闲时驱动会卸载上下文，下次使用需 **1-2 秒**初始化。
+
+```bash
+# 启用 persistence mode
+nvidia-smi -pm 1
+systemctl enable nvidia-persistenced
+```
+
+不加速计算本身，但消除冷启动延迟。对频繁启停的训练集群和低流量推理场景很重要。
+
+#### 3.2 Multi-Process Service (MPS)
+
+默认多进程共享 GPU 时采用时间片轮转——GPU 在进程间 "ping-pong" 切换，利用率低。MPS 将多个进程的 context 合并为一个调度上下文，允许内核**并发执行**。
+
+**场景：** 4 个推理任务共享一个 40 GB GPU，每个只用 5-10 GB 和 30% 计算。
+
+| 模式 | GPU 利用率 | 完成时间（2 个 1h 任务） |
+| --- | --- | --- |
+| 默认 time-slicing | ~30%（一次只跑一个） | ~2 小时 |
+| MPS | 80-90%（并发） | ~1 小时多 |
+
+```bash
+# 启动 MPS
+nvidia-cuda-mps-control -d
+
+# 限制单个 client 使用 50% SM
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50
+```
+
+**局限：** MPS 不隔离 GPU 内存——一个进程 OOM 会影响所有其他进程。
+
+<Accordion title="验证方式：mig_mps_tool.py">
+
+```bash
+python -m ch03.mig_mps_tool --device 0
+```
+
+报告当前 GPU 的 MIG 模式状态、MIG 设备列表、MPS 进程信息。
+
+</Accordion>
+
+#### 3.3 Multi-Instance GPU (MIG)
+
+硬件级分区，将一个 GPU 最多切分为 **7 个独立实例**，每个有独立的 SM、内存、引擎上下文和 L2 cache 份额。
+
+**Blackwell B200 MIG profiles：**
+
+| Profile | 内存占比 | SM 占比 | L2 cache | Copy Engines |
+| --- | --- | --- | --- | --- |
+| `1g.23gb` | 1/8 | 1/7 (~19 SMs) | 1/8 | 2 |
+| `2g.45gb` | 2/8 | 2/7 (~38 SMs) | 2/8 | 3 |
+| `3g.90gb` | 4/8 | 3/7 | 4/8 | 6 |
+| `4g.90gb` | 4/8 | 4/7 | 4/8 | 8 |
+| `7g.180gb` | Full | Full | Full | 16 |
+
+命名规则：`<X>g` = SM 组数量（计算），`<Y>gb` = HBM 容量（内存）。
+
+**MPS vs MIG 选择：**
+
+| 维度 | MPS | MIG |
+| --- | --- | --- |
+| 隔离性 | 无内存隔离 | 强隔离（独立 SM + 内存 + 引擎） |
+| 灵活性 | 动态共享资源 | 硬分区，空闲资源不可借用 |
+| GPU 间通信 | 正常 NVLink/PCIe P2P | **MIG 模式下 P2P 被禁用** |
+| 适用场景 | 多推理任务填充 GPU 利用率 | 多租户需要资源保证 |
+| 大规模训练 | 不需要（一进程一 GPU） | **不适用**（需要全 GPU + 快速互连） |
+
+<Warning>
+MIG 模式下 GPU 间的 peer-to-peer 通信（包括 NVLink）被禁用。CUDA IPC 也受限。大规模分布式训练和 MoE 稀疏推理不适合 MIG。
+</Warning>
+
+#### 3.4 GPU 时钟与 ECC
+
+- **GPU Boost** 自动在功耗/温度限制内调整频率
+- **Benchmark 时必须锁定时钟**，否则后续 run 可能因热节流而变慢，导致错误结论
+
+```bash
+# 锁定 GPU 核心时钟（benchmark 用）
+nvidia-smi -lgc <min_clock>,<max_clock>
+# 锁定显存时钟
+nvidia-smi -ac <mem_clock>,<sm_clock>
+# 设置功耗上限（低于 TDP）减少热节流
+nvidia-smi -pl <watts>
+```
+
+- **ECC 内存** 在数据中心 GPU 上默认启用，应保持启用。长训练中单 bit 错误可能 crash 或悄悄污染模型。
+
+<Accordion title="验证方式：power_tuning_tool.py">
+
+```bash
+python -m ch03.power_tuning_tool --power-limits 300,350 --iterations 5 --warmup 1
+```
+
+扫描不同功耗上限下的 GEMM 性能，输出 Time、TFLOP/s、Avg/Max Power、TFLOP/J（性能功耗比）。
+
+</Accordion>
+
+#### 3.5 GPU 内存管理
+
+- **PyTorch** 按需分配 GPU 内存；**TensorFlow** 默认占满（`TF_FORCE_GPU_ALLOW_GROWTH=true` 改为按需）
+- CUDA **Unified Memory** + Hopper/Blackwell 的 **Page Migration Engine (PME)** 支持 GPU-CPU 自动页面迁移——但有性能惩罚，是安全网不是优化手段
+- PyTorch **caching allocator**（通过 `PYTORCH_ALLOC_CONF` 配置）减少碎片和重复分配
+- GPU OOM 时：用 `torch.cuda.memory_stats()` 和 `torch.cuda.memory_summary()` 诊断；NVIDIA Nsight Systems 可显示内存使用模式
+
+### 4. 容器运行时优化
+
+#### 4.1 NVIDIA Container Toolkit
+
+容器共享宿主 OS 内核，没有 hypervisor 层。**GPU 性能与裸机几乎无差别（&lt;2% 差异）**——MLPerf Inference v5.0 就是在 OpenShift/Kubernetes 容器中提交的。
+
+工作原理：
+- 容器内提供 CUDA runtime 库（`libcudart.so`）
+- NVIDIA Container Toolkit 在容器启动时注入宿主的 driver 库（`libcuda.so`、`libnvidia-ml.so`）
+- 关键规则：**宿主 NVIDIA driver 版本必须 ≥ 容器内 CUDA 版本要求的最低 driver 版本**
+
+#### 4.2 避免 Overlay FS 开销
+
+容器的 union filesystem（OverlayFS）在多层查找和 Copy-on-Write 时有额外开销。训练数据应通过 **bind mount** 挂载：
+
+```bash
+docker run --gpus all \
+  -v /data/dataset:/mnt/dataset:ro \
+  -v /output:/mnt/output \
+  nvcr.io/nvidia/pytorch:25.09-py3 python train.py
+```
+
+<Accordion title="验证方式：docker_gpu_optimized.dockerfile">
+
+配套代码提供了完整的多阶段 Dockerfile 示例：
+
+```dockerfile
+FROM nvcr.io/nvidia/pytorch:25.11-py3 AS base
+RUN apt-get update && apt-get install -y numactl libnuma-dev tcmalloc-minimal jemalloc
+
+ENV MALLOC_CONF="narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true"
+ENV TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=536870912
+ENV PYTORCH_ALLOC_CONF=max_split_size_mb:512
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+ENTRYPOINT ["numactl", "--interleave=all", "python"]
+CMD ["train.py"]
+```
+
+关键点：基于 NGC 官方镜像、安装 `numactl`/`jemalloc`/`tcmalloc`、设置所有环境变量、使用 `numactl --interleave=all` 作为入口点。
+
+</Accordion>
+
+### 5. Kubernetes 编排与拓扑感知调度
+
+#### 5.1 GPU Operator 与 Device Plugin
+
+- **NVIDIA Device Plugin** 向 K8s 暴露 GPU 设备（`nvidia.com/gpu`），自动挂载设备节点到 Pod
+- **GPU Operator** 自动化安装 driver、device plugin、Container Toolkit、DCGM 监控；通过 **GPU Feature Discovery** 为每个 GPU 打上 NUMA/NVLink 拓扑标签
+
+#### 5.2 Topology Manager
+
+**默认 K8s 不感知拓扑。** 请求 4 个 GPU 可能被分配到不同 NVLink domain，通信带宽减半。
+
+对于 NVL72 系统（72 GPU，rack 级 ~130 TB/s NVLink 带宽，1.8 TB/s/GPU），不感知拓扑的调度完全浪费了 NVLink 优势。
+
+配置 `--topology-manager-policy`：
+
+| 策略 | 行为 |
+| --- | --- |
+| `best-effort` | 尽力满足拓扑对齐，不保证 |
+| `restricted` | 拓扑不满足则拒绝调度 |
+| `single-numa-node` | 所有资源必须在同一 NUMA 节点 |
+
+<Accordion title="验证方式：kubernetes_topology_pod.yaml">
+
+配套代码提供了拓扑感知 Pod 的完整 YAML 示例：
+
+```yaml
+spec:
+  hostNetwork: true  # 直通 InfiniBand
+  topologyManager:
+    policy: "best-effort"
+  containers:
+  - name: training-container
+    resources:
+      limits:
+        nvidia.com/gpu: "4"
+        cpu: "16"
+        memory: "64Gi"
+    env:
+    - name: NCCL_SOCKET_IFNAME
+      value: "ib0"
+    - name: NCCL_NET_GDR_LEVEL
+      value: "3"           # GPUDirect RDMA
+    - name: NCCL_MNNVL_ENABLE
+      value: "1"           # Multi-Node NVLink
+    securityContext:
+      capabilities:
+        add: [IPC_LOCK]    # pinned memory 必需
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: gpu.nvidia.com/nvlink-domain
+            operator: Exists
+```
+
+关键点：host networking 直通 IB、NCCL 环境变量、IPC_LOCK 权限、NVLink domain 节点亲和性、8Gi shared memory。
+
+</Accordion>
+
+#### 5.3 网络优化
+
+- 性能敏感 GPU 作业使用 **host networking**（`hostNetwork: true`），避免 overlay network 开销
+- 安装 Kubernetes RDMA device plugin，启用 GPUDirect RDMA
+- 配置 `NCCL_PORT_RANGE` 和 `NCCL_SOCKET_IFNAME`
+
+#### 5.4 资源隔离与 QoS
+
+| QoS 级别 | 条件 | 驱逐优先级 |
+| --- | --- | --- |
+| **Guaranteed** | 每个容器的 `requests == limits`（CPU + memory） | 最后 |
+| **Burstable** | 至少设了一个 request/limit | 中间 |
+| **BestEffort** | 无 requests/limits | 最先被驱逐 |
+
+**OOM Killer 风险：** 如果不限制其他容器的内存，OOM Killer 可能杀掉你的大训练 Job（因为它占内存最多）。建议性能敏感作业**独占整个节点**的 CPU 和 GPU。
+
+**I/O 隔离：** Kubernetes 原生不支持。需手动配置 cgroup v2 I/O controller。
+
+#### 5.5 MIG 在 Kubernetes 中的使用
+
+MIG 分区以 `nvidia.com/mig-2g.45gb` 等资源类型暴露给调度器。
+
+```yaml
+resources:
+  limits:
+    nvidia.com/mig-2g.45gb: "2"  # 2 个 MIG 实例
+```
+
+**关键约束：** MIG 资源**必须在同一节点上满足**，不能跨节点。如果没有单个节点有两个空闲 `2g.45gb` 实例，Pod 将永远 Pending。
+
+<Accordion title="验证方式：kubernetes_mig_pod.yaml">
+
+配套代码 `ch03/kubernetes_mig_pod.yaml` 示范了请求两个 `2g.45gb` MIG 实例的 Pod 配置，包含 `nodeSelector: mig-enabled: "true"` 节点选择器。
+
+</Accordion>
+
+#### 5.6 调度器：Kubernetes 与 SLURM
+
+| 调度器 | 常用场景 | GPU 拓扑支持 |
+| --- | --- | --- |
+| **SLURM** | 训练集群 | generic resources，可关联 NUMA/NVLink |
+| **Kubernetes** | 推理集群 | device plugin + Topology Manager |
+| **Slinky** | 混合集群 | SLURM + K8s 集成 |
+
+### 6. Grace Blackwell 超级芯片架构
+
+书中多次提到 NVIDIA CPU-GPU 超级芯片（Grace Blackwell、Vera Rubin）通过 **NVLink-C2C**（~900 GB/s）将 CPU 和 GPU 紧密耦合，从根本上缓解 CPU-GPU 数据传输瓶颈。
+
+但即使在这种架构下：
+- Linux 仍将 CPU DRAM 和 GPU HBM 视为独立内存池
+- NUMA 绑定和数据局部性优化依然有意义
+- 仍需配置 hugepages、prefetching、memory pinning
+
+<Tip>
+配套代码 `ch03/grace_blackwell_topology.py` 提供了 Grace Blackwell 系统的 NIC/GPU/NUMA 拓扑发现工具，可生成 IRQ/RPS/XPS 亲和性配置脚本。
+</Tip>
+
+---
+
+## 配套代码验证指南
+
+### 一键运行所有 benchmark
+
+```bash
+cd ai-performance-engineering/code
+python -m ch03.compare
+```
+
+这会自动发现 `ch03/` 下所有 `baseline_*.py` / `optimized_*.py` 对，对每一对运行 warmup 5 轮 + 正式 20 轮计时，输出对比表格。
+
+### 各 benchmark 对说明
+
+| Benchmark 对 | Baseline 做法 | Optimized 做法 | 验证的观点 |
+| --- | --- | --- | --- |
+| `docker` | 非 pinned 内存，阻塞 H2D 拷贝 | pinned 内存 + 双缓冲预取 + copy stream 异步重叠 | pinned memory + overlap = 3.64× 加速 |
+| `gemm` | 2048×2048 矩阵分成 8 个 256×256 block，CPU 同步累加 | `torch.compile(mode="reduce-overhead")` 单次融合 matmul | 避免 kernel launch overhead = 2.90× 加速 |
+| `kubernetes` | 阻塞数据加载，per-step 分配 | pinned + 双缓冲 + 预取 | 容器内数据管线优化 = 1.61× 加速 |
+| `numa_unaware` | ~512 MB pageable 内存，阻塞拷贝 | pinned + 异步 copy stream 重叠 | 内存 pinning 的基础效果 |
+| `rack_prep` | pageable host buffer，无 NUMA/IRQ 调优 | NUMA/IRQ 亲和性 + pinned 双缓冲 | rack 级拓扑感知优化 |
+
+### 工具脚本
+
+```bash
+# 查看 GPU 的 MIG/MPS 状态
+python -m ch03.mig_mps_tool --device 0
+
+# 功耗-性能扫描
+python -m ch03.power_tuning_tool --power-limits 300,350 --iterations 5 --warmup 1
+
+# CUDA 13 Green Contexts 演示（SM 软分区）
+python -m ch03.green_context_demo --sm-fraction 0.5
+```
+
+### Shell 调优脚本
+
+| 脚本 | 用途 |
+| --- | --- |
+| `system_tuning.sh` | 通用 GPU 服务器调优（CPU governor、swap、THP、网络、IRQ、ulimit、persistence mode、NUMA balancing） |
+| `gpu_setup_commands.sh` | GPU 相关命令速查（persistence mode、allocator、ulimit、GPUDirect、NUMA/Docker 示例） |
+| `cpu_gpu_numa_optimizations.sh` | Grace Blackwell 系统专用调优脚本 |
+| `numa_topology_script.sh` | 按 GPU 自动查询 NUMA 拓扑并绑定进程 |
+
+---
 
 ## 笔记与心得
 
-{/* 在此记录阅读笔记和个人心得 */}
+### 核心思想：让 GPU 永远不等待
+
+本章所有优化围绕同一目标——消除导致 GPU 空闲的一切因素：
+
+1. **CPU 不要拖后腿** — NUMA 绑定、CPU pinning、关闭 swap、performance 频率模式
+2. **数据传输不要成为瓶颈** — pinned memory、hugepages、GPUDirect RDMA/GDS、双缓冲预取
+3. **驱动不要引入额外延迟** — persistence mode、MPS/MIG 合理使用
+4. **容器不要增加开销** — bind mount、host networking、正确 CUDA/driver 版本匹配
+5. **调度不要分配错资源** — Topology Manager、NUMA/NVLink 对齐
+
+### 关键数字速查
+
+| 优化项 | 性能影响 |
+| --- | --- |
+| 消除跨 NUMA 流量 | 训练吞吐 +5%–10% |
+| Pinned memory（`pin_memory=True`） | H2D 传输 2–3×，性能 +10%–20% |
+| THP 启用 | 吞吐 +3%–5% |
+| 容器 vs 裸机 | 差异 &lt;2% |
+| 跨 NUMA 内存访问延迟 | ~80 ns → ~139 ns（+75%） |
+| GPU 冷启动开销 | 1-2 秒 |
+| Docker benchmark（baseline → optimized） | 4.456 ms → 1.225 ms（**3.64×**） |
+| GEMM benchmark（baseline → optimized） | 0.548 ms → 0.189 ms（**2.90×**） |
+| K8s benchmark（baseline → optimized） | 1.734 ms → 1.076 ms（**1.61×**） |
+
+---
 
 ## 讨论问题
 
-{/* 在此记录讨论中提出的问题和回答 */}
+1. 在你的集群环境中，是否做过 NUMA 拓扑检查（`nvidia-smi topo -m`）？训练脚本是否显式设置了 NUMA 亲和性？
+2. MPS 和 MIG 在多租户推理场景下如何选择？你的场景更需要高利用率（MPS）还是强隔离（MIG）？
+3. Kubernetes Topology Manager 的 `single-numa-node` 策略在大规模集群中是否足够灵活？有没有遇到调度失败的情况？
+4. 对于 NVL72 这种 rack 级 NVLink 域，调度策略如何避免跨 NVLink 域的 GPU 分配？
+5. 在你的训练流程中，checkpoint 写入是否曾导致 page cache stall？使用了哪些缓解策略？
+6. `jemalloc` 和 `tcmalloc` 在 AI 训练场景下的实际对比效果如何？你的团队是否做过 allocator tuning？
+7. 你运行了 `python -m ch03.compare` 后，实测的 speedup 与上述数字相比如何？差异可能来自哪些因素（GPU 型号、PCIe 带宽、内存带宽）？
